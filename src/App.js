@@ -1,5 +1,6 @@
 // src/App.js
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import axios from "axios";
 import "bootstrap/dist/css/bootstrap.min.css";
 
 /*
@@ -137,7 +138,11 @@ export default function App() {
   const [selectedAbha, setSelectedAbha] = useState("");
 
   /* practitioner (global) */
-  const [selectedPractitionerIdx, setSelectedPractitionerIdx] = useState(0);
+  // const [selectedPractitionerIdx, setSelectedPractitionerIdx] = useState(0);
+  const practitionerReferenceId = window.GlobalPractitioner?.id || uuidv4();
+  const practitionerDisplayName = window.GlobalPractitioner?.name?.[0]?.text || "Fake Doctor";
+  const practitionerLicense = window.GlobalPractitioner?.identifier?.[0]?.value || "FAKE-0000-0000";
+
 
   /* composition meta */
   const [status, setStatus] = useState("final");
@@ -249,6 +254,9 @@ export default function App() {
     // ids
     const compId = uuidv4();
     const patientId = uuidv4();
+    const originalPatientId = String(selectedPatient?.id || "");
+    const mrn = selectedPatient?.user_ref_id || "";
+
     const practitionerId = uuidv4();
     const encounterId = encounterText ? uuidv4() : null;
     const custodianId = custodianName ? uuidv4() : null;
@@ -262,7 +270,9 @@ export default function App() {
     function buildPatientResource() {
       const p = selectedPatient;
       const identifiers = [];
-      const mrn = p?.mrn || p?.user_ref_id || p?.abha_ref || p?.id;
+      const mrn = p?.user_ref_id || "";   // MRN from user_ref_id
+      const patientId = String(p?.id || ""); // ID from id field
+      console.log(patientId);
       if (mrn) identifiers.push({ system: "https://healthid.ndhm.gov.in", value: String(mrn) });
       if (p?.abha_ref) identifiers.push({ system: "https://abdm.gov.in/abha", value: p.abha_ref });
 
@@ -281,28 +291,28 @@ export default function App() {
         name: p.name ? [{ text: p.name }] : undefined,
         gender: p.gender ? String(p.gender).toLowerCase() : undefined,
         birthDate: ddmmyyyyToISO(p.dob) || undefined,
-        telecom: telecom.length ? telecom : undefined,
+        telecom: (p?.mobile || p?.email || selectedAbha) ? [
+          ...(p?.mobile ? [{ system: "phone", value: p.mobile }] : []),
+          ...(p?.email ? [{ system: "email", value: p.email }] : []),
+          ...(selectedAbha ? [{ system: "url", value: `abha://${selectedAbha}` }] : [])
+        ] : undefined,
         address: p?.address ? [{ text: p.address }] : undefined,
       };
     }
 
     // Practitioner resource (global)
-    function buildPractitionerResource() {
-      const p = PRACTITIONERS[selectedPractitionerIdx] || PRACTITIONERS[0];
+    function buildPractitionerResource(practitionerReferenceId, practitionerDisplayName, practitionerLicense) {
       return {
         resourceType: "Practitioner",
-        id: practitionerId,
+        id: practitionerReferenceId,
         language: "en-IN",
-        meta: { profile: ["http://hl7.org/fhir/StructureDefinition/Practitioner"] },
-        text: buildNarrative("Practitioner", `<p>${p.name}</p><p>${p.qualification}</p>`),
-        identifier: p.registration?.system && p.registration?.value ? [{ system: p.registration.system, value: p.registration.value }] : undefined,
-        name: [{ text: p.name }],
-        telecom: [
-          p.phone ? { system: "phone", value: p.phone } : null,
-          p.email ? { system: "email", value: p.email } : null,
-        ].filter(Boolean),
+        meta: { profile: ["https://nrces.in/ndhm/fhir/r4/StructureDefinition/Practitioner"] },
+        text: buildNarrative("Practitioner", `<p>${practitionerDisplayName}</p>`),
+        identifier: [{ type: { coding: [{ system: "http://terminology.hl7.org/CodeSystem/v2-0203", code: "MD", display: "Medical License number" }] }, system: "https://doctor.ndhm.gov.in", value: practitionerLicense }],
+        name: [{ text: practitionerDisplayName }],
       };
     }
+
 
     function buildEncounterResource() {
       if (!encounterId) return null;
@@ -434,13 +444,13 @@ export default function App() {
         id: compId,
         language: "en-IN",
         meta: { profile: ["http://hl7.org/fhir/StructureDefinition/Composition"] },
-        text: buildNarrative("Composition", `<p>${title}</p><p>Author: ${PRACTITIONERS[selectedPractitionerIdx]?.name || ""}</p>`),
+        text: buildNarrative("Composition", `<p>${title}</p><p>Author: ${practitionerDisplayName || ""}</p>`),
         status: status,
         type: { coding: [SNOMED_IMM_RECORD], text: "Immunization record" },
         subject: { reference: `urn:uuid:${patientId}` },
         ...(encounterId ? { encounter: { reference: `urn:uuid:${encounterId}` } } : {}),
         date: authoredOn,
-        author: [{ reference: `urn:uuid:${practitionerId}`, display: PRACTITIONERS[selectedPractitionerIdx]?.name }],
+        author: [{ reference: `urn:uuid:${practitionerReferenceId}`, display: practitionerDisplayName }],
         title: title,
         ...(custodianId ? { custodian: { reference: `urn:uuid:${custodianId}` } } : {}),
         section: [
@@ -460,7 +470,7 @@ export default function App() {
 
     // Build resources
     const patientRes = buildPatientResource();
-    const practitionerRes = buildPractitionerResource();
+    const practitionerRes = buildPractitionerResource(practitionerReferenceId, practitionerDisplayName, practitionerLicense);
     const encounterRes = buildEncounterResource();
     const custodianRes = buildCustodianOrg();
     const immunizationResources = buildImmunizationResources();
@@ -495,7 +505,17 @@ export default function App() {
 
     setJsonOut(JSON.stringify(bundle, null, 2));
     console.log("Generated Immunization Bundle:", bundle);
-    alert("Bundle generated and logged in console. Copy JSON below to validate.");
+    console.log({patient: originalPatientId});
+    axios.post('https://uat.discharge.org.in/api/v5/fhir-bundle', { bundle, patient: originalPatientId })
+      .then(response => {
+        console.log("FHIR Bundle Submitted:", response.data);
+        alert("Submitted successfully");
+      })
+      .catch(error => {
+        console.error("Error submitting FHIR Bundle:", error.response?.data || error.message);
+        alert("Failed to submit FHIR Bundle. See console.");
+      });
+
   }
 
   /* ------------------------------- UI ------------------------------------- */
@@ -559,13 +579,11 @@ export default function App() {
           <div className="row g-3">
             <div className="col-md-6">
               <label className="form-label">Select Practitioner</label>
-              <select className="form-select" value={selectedPractitionerIdx} onChange={e => setSelectedPractitionerIdx(Number(e.target.value))}>
-                {PRACTITIONERS.map((p, i) => <option key={p.id} value={i}>{p.name} ({p.qualification})</option>)}
-              </select>
+              <input className="form-control" readOnly value={practitionerDisplayName} />
             </div>
             <div className="col-md-6">
               <label className="form-label">Practitioner (read only)</label>
-              <input className="form-control" readOnly value={PRACTITIONERS[selectedPractitionerIdx]?.name || ""} />
+              <input className="form-control" readOnly value={practitionerDisplayName || ""} />
             </div>
           </div>
         </div>
