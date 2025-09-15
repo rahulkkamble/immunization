@@ -6,12 +6,18 @@ import "bootstrap/dist/css/bootstrap.min.css";
 /*
   Immunization Record Builder (plain JS, single-file)
   - Patient: fetched from /patients.json (public)
-  - Practitioner: from global window.GlobalPractitioner (FHIR Practitioner) or safe fallback
+  - Practitioner: global PRACTITIONERS (no API)
   - Add/Remove Immunizations (each becomes Immunization resource)
   - Optional ImmunizationRecommendation
   - Upload DocumentReference files (PDF/JPEG/JPG)
   - Produces FHIR Bundle (document) with Composition (SNOMED 41000179103)
 */
+
+/* --------------------------- GLOBAL PRACTITIONERS --------------------------- */
+const PRACTITIONERS = [
+  { id: "prac-1", name: "Dr. A. Verma", qualification: "MBBS, MD", phone: "+919000011111", email: "verma@example.org", registration: { system: "https://nmc.org.in", value: "NMC-123" } },
+  { id: "prac-2", name: "Dr. B. Rao", qualification: "MBBS, MS", phone: "+919000022222", email: "rao@example.org", registration: { system: "https://nmc.org.in", value: "NMC-456" } },
+];
 
 /* ------------------------------- UTILITIES --------------------------------- */
 function uuidv4() {
@@ -20,15 +26,6 @@ function uuidv4() {
     const v = c === "x" ? r : (r & 0x3) | 0x8;
     return v.toString(16);
   });
-}
-
-function isUuid(s) {
-  return typeof s === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(s);
-}
-
-// Ensure we always use a UUID for resource.id when we plan to reference it via urn:uuid:...
-function safeUuid(maybeId) {
-  return isUuid((maybeId || "").toLowerCase()) ? maybeId.toLowerCase() : uuidv4();
 }
 
 function ddmmyyyyToISO(v) {
@@ -140,17 +137,12 @@ export default function App() {
   const [abhaOptions, setAbhaOptions] = useState([]);
   const [selectedAbha, setSelectedAbha] = useState("");
 
-  /* practitioner (global FHIR Practitioner on window.GlobalPractitioner) */
-  // Pull from global; coerce IDs to UUID to keep urn:uuid:... valid
-  const practitionerReferenceId = safeUuid(window.GlobalPractitioner?.id);
-  const practitionerDisplayName =
-    (Array.isArray(window.GlobalPractitioner?.name) && window.GlobalPractitioner?.name?.[0]?.text) ||
-    (typeof window.GlobalPractitioner?.name === "string" ? window.GlobalPractitioner?.name : "") ||
-    "Dr. ABC";
-  const practitionerLicense =
-    (Array.isArray(window.GlobalPractitioner?.identifier) && window.GlobalPractitioner?.identifier?.[0]?.value) ||
-    window.GlobalPractitioner?.license ||
-    "LIC-TEMP-0001";
+  /* practitioner (global) */
+  // const [selectedPractitionerIdx, setSelectedPractitionerIdx] = useState(0);
+  const practitionerReferenceId = window.GlobalPractitioner?.id || uuidv4();
+  const practitionerDisplayName = window.GlobalPractitioner?.name?.[0]?.text || "Fake Doctor";
+  const practitionerLicense = window.GlobalPractitioner?.identifier?.[0]?.value || "FAKE-0000-0000";
+
 
   /* composition meta */
   const [status, setStatus] = useState("final");
@@ -259,10 +251,13 @@ export default function App() {
 
     const authoredOn = localDatetimeToISOWithOffset(dateTimeLocal);
 
-    // ids (always UUIDs for urn:uuid references)
+    // ids
     const compId = uuidv4();
-    const patientId = uuidv4(); // Bundle-local Patient id (UUID)
-    const practitionerId = practitionerReferenceId || uuidv4(); // use global if valid, else UUID
+    const patientId = uuidv4();
+    const originalPatientId = String(selectedPatient?.id || "");
+    const mrn = selectedPatient?.user_ref_id || "";
+
+    const practitionerId = uuidv4();
     const encounterId = encounterText ? uuidv4() : null;
     const custodianId = custodianName ? uuidv4() : null;
 
@@ -271,17 +266,24 @@ export default function App() {
     const docBinaryIds = (files.length ? files : [null]).map(() => uuidv4());
     const docRefIds = docBinaryIds.map(() => uuidv4());
 
-    // Patient resource (use the bundle-local UUID 'patientId' — do not shadow it)
-    function buildPatientResource(idForBundle) {
-      const p = selectedPatient || {};
+    // Patient resource
+    function buildPatientResource() {
+      const p = selectedPatient;
       const identifiers = [];
-      const mrnLocal = p?.user_ref_id || "";   // MRN from user_ref_id
-      if (mrnLocal) identifiers.push({ system: "https://healthid.ndhm.gov.in", value: String(mrnLocal) });
+      const mrn = p?.user_ref_id || "";   // MRN from user_ref_id
+      const patientId = String(p?.id || ""); // ID from id field
+      console.log(patientId);
+      if (mrn) identifiers.push({ system: "https://healthid.ndhm.gov.in", value: String(mrn) });
       if (p?.abha_ref) identifiers.push({ system: "https://abdm.gov.in/abha", value: p.abha_ref });
+
+      const telecom = [];
+      if (p?.mobile) telecom.push({ system: "phone", value: p.mobile });
+      if (p?.email) telecom.push({ system: "email", value: p.email });
+      if (selectedAbha) telecom.push({ system: "url", value: `abha://${selectedAbha}` });
 
       return {
         resourceType: "Patient",
-        id: idForBundle, // keep in sync with Composition.subject reference
+        id: patientId,
         language: "en-IN",
         meta: { profile: ["http://hl7.org/fhir/StructureDefinition/Patient"] },
         text: buildNarrative("Patient", `<p>${p.name || ""}</p><p>${p.gender || ""} ${p.dob || ""}</p>`),
@@ -299,21 +301,18 @@ export default function App() {
     }
 
     // Practitioner resource (global)
-    function buildPractitionerResource(practRefId, practName, practLicense) {
+    function buildPractitionerResource(practitionerReferenceId, practitionerDisplayName, practitionerLicense) {
       return {
         resourceType: "Practitioner",
-        id: practRefId, // must match Composition.author reference
+        id: practitionerReferenceId,
         language: "en-IN",
         meta: { profile: ["https://nrces.in/ndhm/fhir/r4/StructureDefinition/Practitioner"] },
-        text: buildNarrative("Practitioner", `<p>${practName}</p>`),
-        identifier: [{
-          type: { coding: [{ system: "http://terminology.hl7.org/CodeSystem/v2-0203", code: "MD", display: "Medical License number" }] },
-          system: "https://doctor.ndhm.gov.in",
-          value: practLicense
-        }],
-        name: [{ text: practName }],
+        text: buildNarrative("Practitioner", `<p>${practitionerDisplayName}</p>`),
+        identifier: [{ type: { coding: [{ system: "http://terminology.hl7.org/CodeSystem/v2-0203", code: "MD", display: "Medical License number" }] }, system: "https://doctor.ndhm.gov.in", value: practitionerLicense }],
+        name: [{ text: practitionerDisplayName }],
       };
     }
+
 
     function buildEncounterResource() {
       if (!encounterId) return null;
@@ -347,11 +346,7 @@ export default function App() {
     function buildImmunizationResources() {
       return immunizations.map((m, idx) => {
         const id = immIds[idx];
-        const occ = m.occurrenceDate
-          ? (m.occurrenceDate.includes("T")
-              ? new Date(m.occurrenceDate).toISOString()
-              : ddmmyyyyToISO(m.occurrenceDate) || new Date().toISOString())
-          : new Date().toISOString();
+        const occ = m.occurrenceDate ? (m.occurrenceDate.includes("T") ? new Date(m.occurrenceDate).toISOString() : ddmmyyyyToISO(m.occurrenceDate) || new Date().toISOString()) : new Date().toISOString();
         return {
           resourceType: "Immunization",
           id,
@@ -452,10 +447,10 @@ export default function App() {
         text: buildNarrative("Composition", `<p>${title}</p><p>Author: ${practitionerDisplayName || ""}</p>`),
         status: status,
         type: { coding: [SNOMED_IMM_RECORD], text: "Immunization record" },
-        subject: { reference: `urn:uuid:${patientId}` }, // must match patient resource in bundle
+        subject: { reference: `urn:uuid:${patientId}` },
         ...(encounterId ? { encounter: { reference: `urn:uuid:${encounterId}` } } : {}),
         date: authoredOn,
-        author: [{ reference: `urn:uuid:${practitionerId}`, display: practitionerDisplayName }],
+        author: [{ reference: `urn:uuid:${practitionerReferenceId}`, display: practitionerDisplayName }],
         title: title,
         ...(custodianId ? { custodian: { reference: `urn:uuid:${custodianId}` } } : {}),
         section: [
@@ -474,8 +469,8 @@ export default function App() {
     }
 
     // Build resources
-    const patientRes = buildPatientResource(patientId);
-    const practitionerRes = buildPractitionerResource(practitionerId, practitionerDisplayName, practitionerLicense);
+    const patientRes = buildPatientResource();
+    const practitionerRes = buildPractitionerResource(practitionerReferenceId, practitionerDisplayName, practitionerLicense);
     const encounterRes = buildEncounterResource();
     const custodianRes = buildCustodianOrg();
     const immunizationResources = buildImmunizationResources();
@@ -502,7 +497,7 @@ export default function App() {
     if (encounterRes) bundle.entry.push({ fullUrl: `urn:uuid:${encounterRes.id}`, resource: encounterRes });
     if (custodianRes) bundle.entry.push({ fullUrl: `urn:uuid:${custodianRes.id}`, resource: custodianRes });
 
-    immunizationResources.forEach(r => bundle.entry.push({ fullUrl: `urn:uuid:${r.id}`, resource: r }));
+    immunizationResources.forEach((r, i) => bundle.entry.push({ fullUrl: `urn:uuid:${r.id}`, resource: r }));
     if (immRecResource) bundle.entry.push({ fullUrl: `urn:uuid:${immRecResource.id}`, resource: immRecResource });
 
     docRefs.forEach(dr => bundle.entry.push({ fullUrl: `urn:uuid:${dr.id}`, resource: dr }));
@@ -510,11 +505,8 @@ export default function App() {
 
     setJsonOut(JSON.stringify(bundle, null, 2));
     console.log("Generated Immunization Bundle:", bundle);
-
-    const originalPatientId = String(selectedPatient?.id || "");
-    console.log({ patient: originalPatientId });
-
-    axios.post("https://uat.discharge.org.in/api/v5/fhir-bundle", { bundle, patient: originalPatientId })
+    console.log({patient: originalPatientId});
+    axios.post('https://uat.discharge.org.in/api/v5/fhir-bundle', { bundle, patient: originalPatientId })
       .then(response => {
         console.log("FHIR Bundle Submitted:", response.data);
         alert("Submitted successfully");
@@ -522,7 +514,6 @@ export default function App() {
       .catch(error => {
         console.error("Error submitting FHIR Bundle:", error.response?.data || error.message);
         alert("Failed to submit FHIR Bundle. See console.");
-        console.log("FHIR Bundle failed to submit:", {patient: originalPatientId});
       });
 
   }
